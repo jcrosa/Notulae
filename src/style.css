@@ -1,0 +1,32 @@
+:root {
+  color-scheme: light;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #fafaf7;
+  /* Sin resaltados ni menús contextuales al tocar con el dedo/Pencil */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  overscroll-behavior: none;
+}
+
+#ink-canvas {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+  /* Clave: anula el scroll/zoom nativo del navegador sobre el lienzo */
+  touch-action: none;
+  /* Evita el "flash" azul de selección táctil en iOS */
+  -webkit-tap-highlight-color: transparent;
+}
