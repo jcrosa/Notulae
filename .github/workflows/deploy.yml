@@ -31,8 +31,9 @@ jobs:
       - run: npm ci
       - run: npm run build
         env:
-          # Sitio de proyecto: https://<usuario>.github.io/notulae/
-          BASE_PATH: /notulae/
+          # Sitio de proyecto: https://<usuario>.github.io/Notulae/
+          # Debe coincidir EXACTAMENTE con el nombre del repo (mayúscula incluida).
+          BASE_PATH: /Notulae/
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

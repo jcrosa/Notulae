@@ -38,11 +38,11 @@ rama de trabajo. **Una sola vez**, activarlo en el repo:
 
 1. Settings → Pages → **Source = "GitHub Actions"**.
 2. Hacer push a la rama de trabajo; el job `Deploy a GitHub Pages` publica en
-   `https://<usuario>.github.io/notulae/`.
+   `https://<usuario>.github.io/Notulae/`.
 
 ## Cómo probar en el iPad (Fase 0)
 
-1. Abrir en Safari (iPadOS 18.2+) la URL de Pages: `https://<usuario>.github.io/notulae/`.
+1. Abrir en Safari (iPadOS 18.2+) la URL de Pages: `https://<usuario>.github.io/Notulae/`.
 2. Escribir con el Apple Pencil: debe pintar una línea negra fina siguiendo el trazo.
 3. **Rechazo de palma**: apoyar la mano/dedos sobre el lienzo no debe pintar ni
    mover la vista; solo el Pencil pinta.
