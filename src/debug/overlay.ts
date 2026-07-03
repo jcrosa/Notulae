@@ -12,6 +12,13 @@ export class DebugOverlay {
   private frameMsTotal = 0;
   private frameMsMax = 0;
   private strokePoints = 0;
+  // Acumulados desde la carga (no se resetean): diagnóstico de trazos cortados.
+  private endsUp = 0;
+  private endsCancel = 0;
+  /** Máximo hueco entre lotes de entrada consecutivos dentro de un trazo. */
+  private inputGapMax = 0;
+  /** Máximo hueco entre frames renderizados consecutivos durante un trazo. */
+  private frameGapMax = 0;
 
   constructor() {
     this.el = document.createElement('div');
@@ -51,6 +58,22 @@ export class DebugOverlay {
     this.strokePoints = n;
   }
 
+  /** Cuenta cómo terminó un trazo: up normal o cancelación del sistema. */
+  strokeEnd(reason: 'up' | 'cancel'): void {
+    if (reason === 'up') this.endsUp++;
+    else this.endsCancel++;
+  }
+
+  /** Hueco en ms entre este lote de entrada y el anterior del mismo trazo. */
+  inputGap(ms: number): void {
+    if (ms > this.inputGapMax) this.inputGapMax = ms;
+  }
+
+  /** Hueco en ms entre este frame renderizado y el anterior del mismo trazo. */
+  frameGap(ms: number): void {
+    if (ms > this.frameGapMax) this.frameGapMax = ms;
+  }
+
   private tick = (): void => {
     const coalPerEvent = this.events > 0 ? (this.coalescedTotal / this.events).toFixed(1) : '–';
     const frameAvg = this.frameCount > 0 ? (this.frameMsTotal / this.frameCount).toFixed(2) : '–';
@@ -59,7 +82,9 @@ export class DebugOverlay {
       `eventos/s: ${this.events}\n` +
       `coalescidos/evento: ${coalPerEvent}\n` +
       `frame ms (med/máx): ${frameAvg} / ${frameMax}\n` +
-      `puntos trazo: ${this.strokePoints}`;
+      `puntos trazo: ${this.strokePoints}\n` +
+      `fin trazo up/cancel: ${this.endsUp} / ${this.endsCancel}\n` +
+      `hueco máx entrada/frame: ${this.inputGapMax.toFixed(0)} / ${this.frameGapMax.toFixed(0)} ms`;
     this.events = 0;
     this.coalescedTotal = 0;
     this.frameCount = 0;

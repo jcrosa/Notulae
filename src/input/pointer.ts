@@ -9,7 +9,8 @@ export interface PointerHandlers {
    * sirven para el render del frame actual — NUNCA se almacenan.
    */
   onStrokeMove(points: InkPoint[], predicted: InkPoint[]): void;
-  onStrokeEnd(): void;
+  /** `reason` distingue el final normal (up) de una cancelación del sistema. */
+  onStrokeEnd(reason: 'up' | 'cancel'): void;
 }
 
 /**
@@ -48,8 +49,11 @@ export class PointerInput {
     this.canvas.addEventListener('pointerdown', this.onPointerDown, { passive: false });
     this.canvas.addEventListener('pointermove', this.onPointerMove, { passive: false });
     this.canvas.addEventListener('pointerup', this.onPointerUp, { passive: false });
-    this.canvas.addEventListener('pointercancel', this.onPointerUp, { passive: false });
-    this.canvas.addEventListener('pointerleave', this.onPointerUp, { passive: false });
+    this.canvas.addEventListener('pointercancel', this.onPointerCancel, { passive: false });
+    // OJO: pointerleave NO termina el trazo. Con pointer capture activo,
+    // WebKit puede disparar leave espuriamente con el Pencil a velocidad,
+    // y tratarlo como fin de trazo produce trazos cortados/discontinuos.
+    // Los finales legítimos son pointerup y pointercancel.
 
     // Anula el zoom por gesto de Safari en iPad mientras se escribe.
     const preventGesture = (e: Event) => e.preventDefault();
@@ -95,12 +99,20 @@ export class PointerInput {
   };
 
   private onPointerUp = (e: PointerEvent): void => {
+    this.endStroke(e, 'up');
+  };
+
+  private onPointerCancel = (e: PointerEvent): void => {
+    this.endStroke(e, 'cancel');
+  };
+
+  private endStroke(e: PointerEvent, reason: 'up' | 'cancel'): void {
     if (e.pointerId !== this.activePointerId) return;
     e.preventDefault();
     this.activePointerId = null;
     if (this.canvas.hasPointerCapture(e.pointerId)) {
       this.canvas.releasePointerCapture(e.pointerId);
     }
-    this.handlers.onStrokeEnd();
-  };
+    this.handlers.onStrokeEnd(reason);
+  }
 }

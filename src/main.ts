@@ -106,6 +106,9 @@ let dirty = false;
 let rafId = 0;
 /** BBox (doc) pintado en el frame anterior, para borrar solo esa zona. */
 let lastLiveBBox: BBox | null = null;
+/** Timestamps para el diagnóstico de huecos (?debug=1). */
+let lastMoveT = 0;
+let lastFrameT = 0;
 
 function renderLiveFrame(): void {
   rafId = requestAnimationFrame(renderLiveFrame);
@@ -113,6 +116,8 @@ function renderLiveFrame(): void {
   dirty = false;
 
   const t0 = performance.now();
+  if (debug && lastFrameT > 0) debug.frameGap(t0 - lastFrameT);
+  lastFrameT = t0;
   // El outline vivo incluye los predichos, que nunca se almacenan.
   const pts = predictedTail.length > 0 ? current.points.concat(predictedTail) : current.points;
   const outline = strokeOutline(pts, freehandOptsFor(current));
@@ -189,6 +194,8 @@ function inkColorFor(brush: BrushId, color: string): string {
 const input = new PointerInput(liveSurface.canvas, {
   onStrokeStart(point, isPen) {
     debug?.countEvent(1);
+    lastMoveT = performance.now();
+    lastFrameT = 0;
     const s = tools.state;
     const docPoint = toDoc(point);
     if (s.tool === 'eraser') {
@@ -213,6 +220,11 @@ const input = new PointerInput(liveSurface.canvas, {
 
   onStrokeMove(points, predicted) {
     debug?.countEvent(points.length);
+    if (debug) {
+      const now = performance.now();
+      if (lastMoveT > 0) debug.inputGap(now - lastMoveT);
+      lastMoveT = now;
+    }
     if (erasing) {
       for (const p of points) eraseAt(toDoc(p));
       return;
@@ -223,7 +235,10 @@ const input = new PointerInput(liveSurface.canvas, {
     dirty = true;
   },
 
-  onStrokeEnd() {
+  onStrokeEnd(reason) {
+    debug?.strokeEnd(reason);
+    lastMoveT = 0;
+    lastFrameT = 0;
     if (erasing) {
       endErase();
       return;
