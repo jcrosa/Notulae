@@ -5,7 +5,10 @@ import { GestureRecognizer, GesturePointerAdapter } from './input/gestures.ts';
 import { createStroke, type InkPoint, type Stroke } from './ink/stroke.ts';
 import { resolveSize, HIGHLIGHTER_DEFAULT, type BrushId } from './ink/brushes.ts';
 import { strokeOutline, outlineToPath, outlineBBox } from './ink/outline.ts';
+import { strokeHit } from './ink/hittest.ts';
 import { createPage, isInsidePage, PAGE_FORMATS, type PageFormat } from './store/note.ts';
+import { StrokeStore } from './store/strokes.ts';
+import { History } from './store/history.ts';
 import { ToolStore } from './store/toolState.ts';
 import { createToolbar } from './ui/toolbar.ts';
 import {
@@ -56,11 +59,23 @@ let viewport: Viewport = fitToScreen(page, window.innerWidth, window.innerHeight
 /** Escala de referencia para los límites de zoom (se recalcula al re-encuadrar). */
 let fitScale = viewport.scale;
 
-// Trazos SIEMPRE en unidades de documento.
-const strokes: Stroke[] = [];
+// Trazos SIEMPRE en unidades de documento, con historial de comandos.
+const strokes = new StrokeStore();
+const history = new History(strokes, () => {
+  redrawStatic();
+  syncHistoryUi();
+});
+
+/** Trazos ocultados en vivo durante un arrastre de borrador. */
+const hiddenIds = new Set<string>();
+
+function visibleStrokes(): readonly Stroke[] {
+  if (hiddenIds.size === 0) return strokes.all;
+  return strokes.all.filter((s) => !hiddenIds.has(s.id));
+}
 
 function redrawStatic(): void {
-  staticSurface.renderScene(page, viewport, strokes);
+  staticSurface.renderScene(page, viewport, visibleStrokes());
 }
 
 /** Coalesce a un repintado de la estática por frame durante pan/zoom. */
@@ -121,6 +136,42 @@ function stopRaf(): void {
   }
 }
 
+// ---- Borrador --------------------------------------------------------------------
+
+let erasing = false;
+
+/** Radio del borrador: ~12 px constantes en pantalla, con suelo en doc. */
+function eraserRadius(): number {
+  return Math.max(6, 12 / viewport.scale);
+}
+
+function eraseAt(docPoint: InkPoint): void {
+  const radius = eraserRadius();
+  let hitSomething = false;
+  for (const stroke of strokes.all) {
+    if (hiddenIds.has(stroke.id)) continue;
+    if (strokeHit(stroke, docPoint, radius)) {
+      hiddenIds.add(stroke.id);
+      hitSomething = true;
+    }
+  }
+  if (hitSomething) scheduleStaticRedraw();
+  liveSurface.renderEraserCursor(docPoint, radius, viewport, lastLiveBBox);
+  const r = radius + 4;
+  lastLiveBBox = { x: docPoint.x - r, y: docPoint.y - r, w: r * 2, h: r * 2 };
+}
+
+function endErase(): void {
+  erasing = false;
+  liveSurface.clear();
+  lastLiveBBox = null;
+  if (hiddenIds.size > 0) {
+    // Un único comando por arrastre: deshacerlo restaura todos los trazos.
+    history.pushErase([...hiddenIds]);
+    hiddenIds.clear();
+  }
+}
+
 // ---- Escritura con el Pencil ----------------------------------------------------
 
 /** Convierte un punto del input (px CSS) a unidades de documento. */
@@ -139,8 +190,13 @@ const input = new PointerInput(liveSurface.canvas, {
   onStrokeStart(point, isPen) {
     debug?.countEvent(1);
     const s = tools.state;
-    if (s.tool === 'eraser') return; // el borrador llega en el Bloque 4
     const docPoint = toDoc(point);
+    if (s.tool === 'eraser') {
+      erasing = true;
+      lastLiveBBox = null;
+      eraseAt(docPoint);
+      return;
+    }
     if (!isInsidePage(page, docPoint)) return; // no se escribe fuera del papel
     current = createStroke(
       s.tool,
@@ -157,6 +213,10 @@ const input = new PointerInput(liveSurface.canvas, {
 
   onStrokeMove(points, predicted) {
     debug?.countEvent(points.length);
+    if (erasing) {
+      for (const p of points) eraseAt(toDoc(p));
+      return;
+    }
     if (!current) return;
     for (const p of points) current.points.push(toDoc(p));
     predictedTail = predicted.map(toDoc);
@@ -164,12 +224,15 @@ const input = new PointerInput(liveSurface.canvas, {
   },
 
   onStrokeEnd() {
+    if (erasing) {
+      endErase();
+      return;
+    }
     stopRaf();
     if (!current) return;
-    // Trazo final SIN predichos: pasa a la capa estática (con su estilo real,
-    // p.ej. multiply del subrayador, y a las cachés de path/bitmap).
-    strokes.push(current);
-    redrawStatic();
+    // Trazo final SIN predichos: entra al documento vía historial (con su
+    // estilo real, p.ej. multiply del subrayador, y a las cachés).
+    history.pushAdd(current);
     liveSurface.clear();
     current = null;
     predictedTail = [];
@@ -178,11 +241,11 @@ const input = new PointerInput(liveSurface.canvas, {
   },
 });
 
-// ---- Gestos de 2 dedos: pinch = zoom, arrastre = pan -----------------------------
+// ---- Gestos: pinch = zoom, pan de 2 dedos, tap 2 dedos = undo, 3 = redo -----------
 
 const gestures = new GestureRecognizer({
   onPinchPan(centroid, dx, dy, scaleFactor) {
-    if (current) return; // el pen tiene prioridad; no mover el lienzo escribiendo
+    if (current || erasing) return; // el pen tiene prioridad
     viewport = panBy(
       zoomAt(viewport, centroid, scaleFactor, fitScale * MIN_ZOOM_FACTOR, fitScale * MAX_ZOOM_FACTOR),
       dx,
@@ -190,13 +253,23 @@ const gestures = new GestureRecognizer({
     );
     scheduleStaticRedraw();
   },
-  // Los taps de 2/3 dedos se cablean a undo/redo en el Bloque 4.
+  onTap(fingers) {
+    if (fingers === 2) history.undo();
+    else if (fingers >= 3) history.redo();
+  },
 });
 new GesturePointerAdapter(liveSurface.canvas, gestures);
 
 // ---- Toolbar ----------------------------------------------------------------------
 
-createToolbar(tools);
+const toolbar = createToolbar(tools, {
+  onUndo: () => history.undo(),
+  onRedo: () => history.redo(),
+});
+
+function syncHistoryUi(): void {
+  toolbar.setHistoryState(history.canUndo(), history.canRedo());
+}
 
 // ---- Resize / rotación -------------------------------------------------------------
 

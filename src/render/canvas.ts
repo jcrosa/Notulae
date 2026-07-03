@@ -209,4 +209,26 @@ export class CanvasSurface {
     }
     ctx.restore();
   }
+
+  /**
+   * Cursor del borrador en la capa viva: un círculo con el radio efectivo
+   * (en unidades de documento), borrando el del frame anterior.
+   */
+  renderEraserCursor(
+    center: { x: number; y: number },
+    radius: number,
+    viewport: Viewport,
+    clearBox: BBox | null,
+  ): void {
+    const { ctx } = this;
+    ctx.save();
+    this.applyViewport(viewport);
+    if (clearBox) ctx.clearRect(clearBox.x, clearBox.y, clearBox.w, clearBox.h);
+    ctx.beginPath();
+    ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.45)';
+    ctx.lineWidth = 1.5 / viewport.scale; // ~1.5 px constantes en pantalla
+    ctx.stroke();
+    ctx.restore();
+  }
 }

@@ -81,6 +81,11 @@ body {
   background: #dbeafe;
 }
 
+#toolbar button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 #toolbar .swatch::before {
   content: '';
   width: 22px;

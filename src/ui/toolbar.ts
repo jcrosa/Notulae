@@ -19,16 +19,26 @@ const FORMAT_LABELS: Record<PageFormat, string> = {
   screen: 'Pantalla',
 };
 
+export interface ToolbarActions {
+  onUndo(): void;
+  onRedo(): void;
+}
+
+export interface ToolbarHandle {
+  /** Refresca el estado enabled/disabled de los botones undo/redo. */
+  setHistoryState(canUndo: boolean, canRedo: boolean): void;
+}
+
 /**
  * Toolbar mínima en DOM puro. Se maneja con el dedo (el dedo no pinta, así
  * que no hay conflicto con el lienzo). Escribe en ToolStore; el hot path del
  * trazo nunca toca este código.
  */
-export function createToolbar(store: ToolStore): HTMLElement {
+export function createToolbar(store: ToolStore, actions: ToolbarActions): ToolbarHandle {
   const bar = document.createElement('div');
   bar.id = 'toolbar';
 
-  // --- Pinceles ---
+  // --- Pinceles + borrador ---
   const brushGroup = group();
   const brushButtons = new Map<BrushId, HTMLButtonElement>();
   for (const id of BRUSH_IDS) {
@@ -37,6 +47,9 @@ export function createToolbar(store: ToolStore): HTMLElement {
     brushButtons.set(id, btn);
     brushGroup.appendChild(btn);
   }
+  const eraserBtn = button('◻️', 'Borrador (por trazo)');
+  eraserBtn.addEventListener('click', () => store.set({ tool: 'eraser' }));
+  brushGroup.appendChild(eraserBtn);
   bar.appendChild(brushGroup);
 
   // --- Colores ---
@@ -80,10 +93,21 @@ export function createToolbar(store: ToolStore): HTMLElement {
   select.addEventListener('change', () => store.set({ pageFormat: select.value as PageFormat }));
   bar.appendChild(select);
 
+  // --- Undo / redo ---
+  const historyGroup = group();
+  const undoBtn = button('↩️', 'Deshacer (tap con 2 dedos)');
+  undoBtn.addEventListener('click', actions.onUndo);
+  const redoBtn = button('↪️', 'Rehacer (tap con 3 dedos)');
+  redoBtn.addEventListener('click', actions.onRedo);
+  undoBtn.disabled = redoBtn.disabled = true;
+  historyGroup.append(undoBtn, redoBtn);
+  bar.appendChild(historyGroup);
+
   // --- Estado activo ---
   const sync = (): void => {
     const s = store.state;
     for (const [id, btn] of brushButtons) btn.setAttribute('aria-pressed', String(s.tool === id));
+    eraserBtn.setAttribute('aria-pressed', String(s.tool === 'eraser'));
     for (const [c, btn] of colorButtons) btn.setAttribute('aria-pressed', String(s.color === c));
     for (const [k, btn] of sizeButtons) btn.setAttribute('aria-pressed', String(s.sizeKey === k));
     select.value = s.pageFormat;
@@ -92,7 +116,12 @@ export function createToolbar(store: ToolStore): HTMLElement {
   sync();
 
   document.body.appendChild(bar);
-  return bar;
+  return {
+    setHistoryState(canUndo, canRedo) {
+      undoBtn.disabled = !canUndo;
+      redoBtn.disabled = !canRedo;
+    },
+  };
 }
 
 function group(): HTMLDivElement {
