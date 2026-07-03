@@ -1,13 +1,23 @@
-import type { InkPoint, Stroke } from '../ink/stroke.ts';
+import type { Stroke } from '../ink/stroke.ts';
+import { strokeOutline, outlineToPath, type FreehandOptions } from '../ink/outline.ts';
+
+/** Caja en píxeles CSS. */
+export interface BBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
 /**
- * Superficie de dibujo sobre <canvas>. Encapsula el manejo del
- * devicePixelRatio y el redimensionado, y expone dos operaciones de render:
+ * Superficie de dibujo sobre <canvas>. Encapsula DPR/resize y expone
+ * operaciones de relleno de Path2D. Hay dos instancias en la app:
  *
- *  - `drawSegment`: dibujo incremental del último tramo (hot path del trazo).
- *  - `redrawAll`: repintado completo (solo tras resize/limpieza).
+ *  - capa estática (#ink-canvas): trazos terminados; solo se repinta al
+ *    terminar un trazo, en resize o en undo/redo.
+ *  - capa viva (#live-canvas): el trazo en curso, repintado por frame (rAF),
+ *    porque perfect-freehand recalcula el outline completo cada vez.
  *
- * En Fase 0 el render es crudo: polilínea de grosor constante, sin suavizado.
  * El contexto se pide con `desynchronized: true` para reducir la latencia
  * percibida en Safari.
  */
@@ -15,6 +25,8 @@ export class CanvasSurface {
   readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
   private dpr = 1;
+  /** Cache de Path2D por trazo terminado (clave débil: se libera solo). */
+  private readonly pathCache = new WeakMap<Stroke, Path2D>();
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -32,8 +44,6 @@ export class CanvasSurface {
     this.canvas.height = Math.round(clientHeight * this.dpr);
     // Trabajamos siempre en píxeles CSS: escalamos el contexto por el DPR.
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.ctx.lineCap = 'round';
-    this.ctx.lineJoin = 'round';
   }
 
   /** Borra todo el lienzo. */
@@ -44,43 +54,33 @@ export class CanvasSurface {
     this.ctx.restore();
   }
 
+  /** Borra solo una zona (en píxeles CSS). Hot path de la capa viva. */
+  clearRect(box: BBox): void {
+    this.ctx.clearRect(box.x, box.y, box.w, box.h);
+  }
+
+  /** Rellena un Path2D con un color. */
+  fillPath(path: Path2D, color: string): void {
+    this.ctx.fillStyle = color;
+    this.ctx.fill(path);
+  }
+
   /**
-   * Dibuja el tramo entre los dos últimos puntos de un trazo en curso.
-   * Es el camino caliente: se llama en cada `pointermove`.
+   * Pinta un trazo terminado usando (y alimentando) la caché de Path2D.
+   * El outline solo se calcula la primera vez.
    */
-  drawSegment(from: InkPoint, to: InkPoint, stroke: Stroke): void {
-    this.ctx.strokeStyle = stroke.color;
-    this.ctx.lineWidth = stroke.size;
-    this.ctx.beginPath();
-    this.ctx.moveTo(from.x, from.y);
-    this.ctx.lineTo(to.x, to.y);
-    this.ctx.stroke();
-  }
-
-  /** Dibuja un punto aislado (trazo de un solo toque). */
-  drawDot(point: InkPoint, stroke: Stroke): void {
-    this.ctx.fillStyle = stroke.color;
-    this.ctx.beginPath();
-    this.ctx.arc(point.x, point.y, stroke.size / 2, 0, Math.PI * 2);
-    this.ctx.fill();
-  }
-
-  /** Repinta un trazo completo (usado en el redibujado tras resize). */
-  drawStroke(stroke: Stroke): void {
-    const { points } = stroke;
-    if (points.length === 0) return;
-    if (points.length === 1) {
-      this.drawDot(points[0], stroke);
-      return;
+  drawStroke(stroke: Stroke, opts: FreehandOptions): void {
+    let path = this.pathCache.get(stroke);
+    if (!path) {
+      path = outlineToPath(strokeOutline(stroke.points, opts));
+      this.pathCache.set(stroke, path);
     }
-    for (let i = 1; i < points.length; i++) {
-      this.drawSegment(points[i - 1], points[i], stroke);
-    }
+    this.fillPath(path, stroke.color);
   }
 
-  /** Repinta todos los trazos desde cero. */
-  redrawAll(strokes: readonly Stroke[]): void {
+  /** Repinta todos los trazos desde cero (resize, undo/redo). */
+  redrawAll(strokes: readonly Stroke[], optsFor: (s: Stroke) => FreehandOptions): void {
     this.clear();
-    for (const stroke of strokes) this.drawStroke(stroke);
+    for (const stroke of strokes) this.drawStroke(stroke, optsFor(stroke));
   }
 }

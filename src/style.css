@@ -21,7 +21,10 @@ body {
   overscroll-behavior: none;
 }
 
-#ink-canvas {
+#ink-canvas,
+#live-canvas {
+  position: fixed;
+  inset: 0;
   display: block;
   width: 100vw;
   height: 100vh;
@@ -29,4 +32,9 @@ body {
   touch-action: none;
   /* Evita el "flash" azul de selección táctil en iOS */
   -webkit-tap-highlight-color: transparent;
+}
+
+/* La capa viva va encima y es quien recibe los eventos de puntero. */
+#live-canvas {
+  z-index: 2;
 }

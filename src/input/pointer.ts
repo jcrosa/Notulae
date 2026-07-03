@@ -2,8 +2,13 @@ import type { InkPoint } from '../ink/stroke.ts';
 
 /** Callbacks que consume el pipeline superior (ink + render). */
 export interface PointerHandlers {
-  onStrokeStart(point: InkPoint): void;
-  onStrokeMove(point: InkPoint): void;
+  onStrokeStart(point: InkPoint, isPen: boolean): void;
+  /**
+   * Puntos nuevos de este pointermove. `points` son los eventos coalescidos
+   * (van al stroke); `predicted` son los predichos por el sistema y solo
+   * sirven para el render del frame actual — NUNCA se almacenan.
+   */
+  onStrokeMove(points: InkPoint[], predicted: InkPoint[]): void;
   onStrokeEnd(): void;
 }
 
@@ -16,19 +21,27 @@ export interface PointerHandlers {
  *  - El ratón se acepta solo como comodidad para probar en escritorio.
  *  - Mientras un trazo está activo, se ignora cualquier otro puntero.
  *
- * En Fase 0 tomamos únicamente el evento principal de cada `pointermove`.
- * El consumo de `getCoalescedEvents()` para no perder puntos a alta
- * velocidad es trabajo de Fase 1.
+ * Consume `getCoalescedEvents()` en cada `pointermove` para no perder puntos
+ * a alta velocidad (~240 Hz en iPad) y `getPredictedEvents()` para reducir la
+ * latencia percibida del tramo final del trazo vivo.
  */
 export class PointerInput {
   private readonly canvas: HTMLCanvasElement;
   private readonly handlers: PointerHandlers;
   private activePointerId: number | null = null;
+  /** Rect cacheado del lienzo: getBoundingClientRect por evento fuerza layout. */
+  private rect: DOMRect;
 
   constructor(canvas: HTMLCanvasElement, handlers: PointerHandlers) {
     this.canvas = canvas;
     this.handlers = handlers;
+    this.rect = canvas.getBoundingClientRect();
     this.attach();
+  }
+
+  /** Debe llamarse tras un resize/rotación para refrescar el rect cacheado. */
+  refreshRect(): void {
+    this.rect = this.canvas.getBoundingClientRect();
   }
 
   private attach(): void {
@@ -52,12 +65,11 @@ export class PointerInput {
 
   /** Convierte un PointerEvent a un punto normalizado en píxeles CSS del lienzo. */
   private toInkPoint(e: PointerEvent): InkPoint {
-    const rect = this.canvas.getBoundingClientRect();
     // pressure es 0 para el ratón; usamos 0.5 como valor neutro por defecto.
     const pressure = e.pressure > 0 ? e.pressure : 0.5;
     return {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top,
+      x: e.clientX - this.rect.left,
+      y: e.clientY - this.rect.top,
       pressure,
     };
   }
@@ -66,15 +78,20 @@ export class PointerInput {
     if (this.activePointerId !== null) return; // ya hay un trazo en curso
     if (!this.canPaint(e.pointerType)) return; // rechazo de palma / dedo
     e.preventDefault();
+    this.refreshRect();
     this.activePointerId = e.pointerId;
     this.canvas.setPointerCapture(e.pointerId);
-    this.handlers.onStrokeStart(this.toInkPoint(e));
+    this.handlers.onStrokeStart(this.toInkPoint(e), e.pointerType === 'pen');
   };
 
   private onPointerMove = (e: PointerEvent): void => {
     if (e.pointerId !== this.activePointerId) return;
     e.preventDefault();
-    this.handlers.onStrokeMove(this.toInkPoint(e));
+    const coalesced = e.getCoalescedEvents?.() ?? [];
+    const events = coalesced.length > 0 ? coalesced : [e];
+    const points = events.map((ev) => this.toInkPoint(ev));
+    const predicted = (e.getPredictedEvents?.() ?? []).map((ev) => this.toInkPoint(ev));
+    this.handlers.onStrokeMove(points, predicted);
   };
 
   private onPointerUp = (e: PointerEvent): void => {
