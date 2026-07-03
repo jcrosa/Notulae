@@ -1,7 +1,9 @@
 import type { Stroke } from '../ink/stroke.ts';
 import { strokeOutline, outlineToPath, type FreehandOptions } from '../ink/outline.ts';
+import type { Page } from '../store/note.ts';
+import type { Viewport } from './viewport.ts';
 
-/** Caja en píxeles CSS. */
+/** Caja en unidades de documento. */
 export interface BBox {
   x: number;
   y: number;
@@ -9,17 +11,22 @@ export interface BBox {
   h: number;
 }
 
+/** Color del escritorio (fuera de la página). */
+const DESK_COLOR = '#e5e5e0';
+/** Color del papel. */
+const PAPER_COLOR = '#ffffff';
+
 /**
- * Superficie de dibujo sobre <canvas>. Encapsula DPR/resize y expone
- * operaciones de relleno de Path2D. Hay dos instancias en la app:
+ * Superficie de dibujo sobre <canvas>. Encapsula DPR/resize y el transform
+ * documento→pantalla del viewport. Hay dos instancias en la app:
  *
- *  - capa estática (#ink-canvas): trazos terminados; solo se repinta al
- *    terminar un trazo, en resize o en undo/redo.
+ *  - capa estática (#ink-canvas): escritorio + página + trazos terminados;
+ *    se repinta al terminar un trazo, en resize, pan/zoom o undo/redo.
  *  - capa viva (#live-canvas): el trazo en curso, repintado por frame (rAF),
  *    porque perfect-freehand recalcula el outline completo cada vez.
  *
- * El contexto se pide con `desynchronized: true` para reducir la latencia
- * percibida en Safari.
+ * Todo el dibujo de tinta ocurre en unidades de documento; el transform del
+ * contexto (DPR × viewport) hace el resto.
  */
 export class CanvasSurface {
   readonly canvas: HTMLCanvasElement;
@@ -42,8 +49,6 @@ export class CanvasSurface {
     const { clientWidth, clientHeight } = this.canvas;
     this.canvas.width = Math.round(clientWidth * this.dpr);
     this.canvas.height = Math.round(clientHeight * this.dpr);
-    // Trabajamos siempre en píxeles CSS: escalamos el contexto por el DPR.
-    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
   }
 
   /** Borra todo el lienzo. */
@@ -54,33 +59,89 @@ export class CanvasSurface {
     this.ctx.restore();
   }
 
-  /** Borra solo una zona (en píxeles CSS). Hot path de la capa viva. */
-  clearRect(box: BBox): void {
-    this.ctx.clearRect(box.x, box.y, box.w, box.h);
+  /** Aplica DPR × viewport: a partir de aquí se dibuja en unidades de documento. */
+  private applyViewport(v: Viewport): void {
+    this.ctx.setTransform(
+      this.dpr * v.scale,
+      0,
+      0,
+      this.dpr * v.scale,
+      this.dpr * v.tx,
+      this.dpr * v.ty,
+    );
   }
 
-  /** Rellena un Path2D con un color. */
-  fillPath(path: Path2D, color: string): void {
-    this.ctx.fillStyle = color;
-    this.ctx.fill(path);
+  private clipToPage(page: Page): void {
+    this.ctx.beginPath();
+    this.ctx.rect(0, 0, page.width, page.height);
+    this.ctx.clip();
   }
 
-  /**
-   * Pinta un trazo terminado usando (y alimentando) la caché de Path2D.
-   * El outline solo se calcula la primera vez.
-   */
-  drawStroke(stroke: Stroke, opts: FreehandOptions): void {
+  /** Path2D cacheado de un trazo terminado (calcula el outline solo una vez). */
+  private pathFor(stroke: Stroke, opts: FreehandOptions): Path2D {
     let path = this.pathCache.get(stroke);
     if (!path) {
       path = outlineToPath(strokeOutline(stroke.points, opts));
       this.pathCache.set(stroke, path);
     }
-    this.fillPath(path, stroke.color);
+    return path;
   }
 
-  /** Repinta todos los trazos desde cero (resize, undo/redo). */
-  redrawAll(strokes: readonly Stroke[], optsFor: (s: Stroke) => FreehandOptions): void {
-    this.clear();
-    for (const stroke of strokes) this.drawStroke(stroke, optsFor(stroke));
+  /**
+   * Repinta la escena completa de la capa estática: escritorio, página con
+   * sombra y todos los trazos (recortados a la página).
+   */
+  renderScene(
+    page: Page,
+    viewport: Viewport,
+    strokes: readonly Stroke[],
+    optsFor: (s: Stroke) => FreehandOptions,
+  ): void {
+    const { ctx } = this;
+    ctx.save();
+    // Escritorio a pantalla completa (espacio de pantalla, solo DPR).
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    ctx.fillStyle = DESK_COLOR;
+    ctx.fillRect(0, 0, this.canvas.clientWidth, this.canvas.clientHeight);
+
+    // Página con sombra (la sombra no se ve afectada por el transform:
+    // queda constante en pantalla, que es lo deseado).
+    this.applyViewport(viewport);
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.18)';
+    ctx.shadowBlur = 12;
+    ctx.shadowOffsetY = 4;
+    ctx.fillStyle = PAPER_COLOR;
+    ctx.fillRect(0, 0, page.width, page.height);
+    ctx.shadowColor = 'transparent';
+
+    // Tinta, recortada al papel.
+    this.clipToPage(page);
+    for (const stroke of strokes) {
+      ctx.fillStyle = stroke.color;
+      ctx.fill(this.pathFor(stroke, optsFor(stroke)));
+    }
+    ctx.restore();
+  }
+
+  /**
+   * Frame del trazo vivo: borra la zona del frame anterior (bbox en unidades
+   * de documento) y rellena el path actual, recortado a la página.
+   * Es el hot path: un clearRect parcial + un fill por frame.
+   */
+  renderLiveStroke(
+    path: Path2D,
+    color: string,
+    page: Page,
+    viewport: Viewport,
+    clearBox: BBox | null,
+  ): void {
+    const { ctx } = this;
+    ctx.save();
+    this.applyViewport(viewport);
+    if (clearBox) ctx.clearRect(clearBox.x, clearBox.y, clearBox.w, clearBox.h);
+    this.clipToPage(page);
+    ctx.fillStyle = color;
+    ctx.fill(path);
+    ctx.restore();
   }
 }
