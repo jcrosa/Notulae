@@ -30,6 +30,9 @@ export default [
     },
     rules: {
       ...tseslint.configs.recommended.rules,
+      // TypeScript ya comprueba los identificadores (incluidos los tipos del
+      // DOM como GlobalCompositeOperation, que no-undef no conoce).
+      'no-undef': 'off',
       '@typescript-eslint/no-unused-vars': [
         'error',
         { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },

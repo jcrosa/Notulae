@@ -1,16 +1,13 @@
 import './style.css';
-import { CanvasSurface, type BBox } from './render/canvas.ts';
+import { CanvasSurface, freehandOptsFor, type BBox } from './render/canvas.ts';
 import { PointerInput } from './input/pointer.ts';
 import { GestureRecognizer, GesturePointerAdapter } from './input/gestures.ts';
 import { createStroke, type InkPoint, type Stroke } from './ink/stroke.ts';
-import {
-  strokeOutline,
-  outlineToPath,
-  outlineBBox,
-  DEFAULT_FREEHAND,
-  type FreehandOptions,
-} from './ink/outline.ts';
+import { resolveSize, HIGHLIGHTER_DEFAULT, type BrushId } from './ink/brushes.ts';
+import { strokeOutline, outlineToPath, outlineBBox } from './ink/outline.ts';
 import { createPage, isInsidePage, PAGE_FORMATS, type PageFormat } from './store/note.ts';
+import { ToolStore } from './store/toolState.ts';
+import { createToolbar } from './ui/toolbar.ts';
 import {
   fitToScreen,
   screenToDoc,
@@ -21,11 +18,6 @@ import {
   type Viewport,
 } from './render/viewport.ts';
 import { DebugOverlay, isDebugEnabled } from './debug/overlay.ts';
-
-// Estilo de tinta fijo hasta el bloque de pinceles (Bloque 3 del plan).
-// Grosor en unidades de documento.
-const INK_COLOR = '#1a1a1a';
-const INK_SIZE = 4;
 
 function getCanvas(id: string): HTMLCanvasElement {
   const el = document.getElementById(id);
@@ -40,19 +32,26 @@ const staticSurface = new CanvasSurface(getCanvas('ink-canvas'));
 const liveSurface = new CanvasSurface(getCanvas('live-canvas'));
 const debug = isDebugEnabled() ? new DebugOverlay() : null;
 
-// ---- Documento y viewport ----------------------------------------------------
+// ---- Estado de herramienta y documento ----------------------------------------
 
-function screenRatio(): number {
-  return window.innerWidth / window.innerHeight;
-}
-
-// Formato provisional por query string (?page=square) hasta la toolbar (Bloque 3).
+// Formato inicial por query string (?page=square) como atajo de pruebas.
 function initialFormat(): PageFormat {
   const q = new URLSearchParams(window.location.search).get('page');
   return PAGE_FORMATS.includes(q as PageFormat) ? (q as PageFormat) : 'a4-portrait';
 }
 
-let page = createPage(initialFormat(), screenRatio());
+function screenRatio(): number {
+  return window.innerWidth / window.innerHeight;
+}
+
+const tools = new ToolStore({
+  tool: 'pen',
+  color: '#1a1a1a',
+  sizeKey: 'medium',
+  pageFormat: initialFormat(),
+});
+
+let page = createPage(tools.state.pageFormat, screenRatio());
 let viewport: Viewport = fitToScreen(page, window.innerWidth, window.innerHeight);
 /** Escala de referencia para los límites de zoom (se recalcula al re-encuadrar). */
 let fitScale = viewport.scale;
@@ -60,12 +59,8 @@ let fitScale = viewport.scale;
 // Trazos SIEMPRE en unidades de documento.
 const strokes: Stroke[] = [];
 
-function freehandFor(_stroke: Stroke, isPen: boolean): FreehandOptions {
-  return { ...DEFAULT_FREEHAND, size: INK_SIZE, simulatePressure: !isPen };
-}
-
 function redrawStatic(): void {
-  staticSurface.renderScene(page, viewport, strokes, (s) => freehandFor(s, true));
+  staticSurface.renderScene(page, viewport, strokes);
 }
 
 /** Coalesce a un repintado de la estática por frame durante pan/zoom. */
@@ -79,11 +74,17 @@ function scheduleStaticRedraw(): void {
   });
 }
 
+// Cambio de formato de página desde la toolbar: re-encuadre, trazos intactos.
+tools.onChange((s) => {
+  if (s.pageFormat !== page.format) {
+    page = createPage(s.pageFormat, screenRatio());
+    refit();
+  }
+});
+
 // ---- Estado del trazo vivo -----------------------------------------------------
 
 let current: Stroke | null = null;
-let currentIsPen = true;
-let currentOpts: FreehandOptions = DEFAULT_FREEHAND;
 /** Últimos puntos predichos (en doc): solo para el render del frame. */
 let predictedTail: readonly InkPoint[] = [];
 let dirty = false;
@@ -99,10 +100,10 @@ function renderLiveFrame(): void {
   const t0 = performance.now();
   // El outline vivo incluye los predichos, que nunca se almacenan.
   const pts = predictedTail.length > 0 ? current.points.concat(predictedTail) : current.points;
-  const outline = strokeOutline(pts, currentOpts);
+  const outline = strokeOutline(pts, freehandOptsFor(current));
   const box = outlineBBox(outline, 4);
   if (box) {
-    liveSurface.renderLiveStroke(outlineToPath(outline), current.color, page, viewport, lastLiveBBox);
+    liveSurface.renderLiveStroke(outlineToPath(outline), current, box, page, viewport, lastLiveBBox);
     lastLiveBBox = box;
   }
   debug?.frameTime(performance.now() - t0);
@@ -128,15 +129,26 @@ function toDoc(p: InkPoint): InkPoint {
   return { x: d.x, y: d.y, pressure: p.pressure };
 }
 
+/** Color efectivo: el subrayador negro no tiene sentido → amarillo. */
+function inkColorFor(brush: BrushId, color: string): string {
+  if (brush === 'highlighter' && color === '#1a1a1a') return HIGHLIGHTER_DEFAULT;
+  return color;
+}
+
 const input = new PointerInput(liveSurface.canvas, {
   onStrokeStart(point, isPen) {
     debug?.countEvent(1);
+    const s = tools.state;
+    if (s.tool === 'eraser') return; // el borrador llega en el Bloque 4
     const docPoint = toDoc(point);
     if (!isInsidePage(page, docPoint)) return; // no se escribe fuera del papel
-    current = createStroke(INK_COLOR, INK_SIZE);
+    current = createStroke(
+      s.tool,
+      inkColorFor(s.tool, s.color),
+      resolveSize(s.tool, s.sizeKey),
+      isPen,
+    );
     current.points.push(docPoint);
-    currentIsPen = isPen;
-    currentOpts = freehandFor(current, isPen);
     predictedTail = [];
     lastLiveBBox = null;
     dirty = true;
@@ -154,9 +166,10 @@ const input = new PointerInput(liveSurface.canvas, {
   onStrokeEnd() {
     stopRaf();
     if (!current) return;
-    // Trazo final SIN predichos: pasa a la capa estática (y a su caché).
+    // Trazo final SIN predichos: pasa a la capa estática (con su estilo real,
+    // p.ej. multiply del subrayador, y a las cachés de path/bitmap).
     strokes.push(current);
-    staticSurface.renderScene(page, viewport, strokes, (s) => freehandFor(s, currentIsPen));
+    redrawStatic();
     liveSurface.clear();
     current = null;
     predictedTail = [];
@@ -181,7 +194,11 @@ const gestures = new GestureRecognizer({
 });
 new GesturePointerAdapter(liveSurface.canvas, gestures);
 
-// ---- Resize / rotación ------------------------------------------------------------
+// ---- Toolbar ----------------------------------------------------------------------
+
+createToolbar(tools);
+
+// ---- Resize / rotación -------------------------------------------------------------
 
 function refit(): void {
   staticSurface.resize();

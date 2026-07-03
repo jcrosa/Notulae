@@ -1,7 +1,14 @@
 import type { Stroke } from '../ink/stroke.ts';
-import { strokeOutline, outlineToPath, type FreehandOptions } from '../ink/outline.ts';
+import { BRUSHES } from '../ink/brushes.ts';
+import {
+  strokeOutline,
+  outlineToPath,
+  outlineBBox,
+  type FreehandOptions,
+} from '../ink/outline.ts';
 import type { Page } from '../store/note.ts';
 import type { Viewport } from './viewport.ts';
+import { composePencilBitmap, subtractGrain, grainAlpha, avgPressure } from './texture.ts';
 
 /** Caja en unidades de documento. */
 export interface BBox {
@@ -15,6 +22,26 @@ export interface BBox {
 const DESK_COLOR = '#e5e5e0';
 /** Color del papel. */
 const PAPER_COLOR = '#ffffff';
+/** Alpha de previsualización del subrayador en la capa viva (multiply no
+ * cruza canvases DOM; el multiply real se aplica al consolidar). */
+const HIGHLIGHTER_PREVIEW_ALPHA = 0.4;
+
+/** Parámetros de perfect-freehand para un trazo según su pincel. */
+export function freehandOptsFor(stroke: Stroke): FreehandOptions {
+  const def = BRUSHES[stroke.brush];
+  return {
+    size: stroke.size,
+    thinning: def.freehand.thinning,
+    smoothing: def.freehand.smoothing,
+    streamline: def.freehand.streamline,
+    simulatePressure: !stroke.fromPen,
+  };
+}
+
+interface PencilBitmap {
+  canvas: HTMLCanvasElement;
+  box: BBox;
+}
 
 /**
  * Superficie de dibujo sobre <canvas>. Encapsula DPR/resize y el transform
@@ -22,8 +49,7 @@ const PAPER_COLOR = '#ffffff';
  *
  *  - capa estática (#ink-canvas): escritorio + página + trazos terminados;
  *    se repinta al terminar un trazo, en resize, pan/zoom o undo/redo.
- *  - capa viva (#live-canvas): el trazo en curso, repintado por frame (rAF),
- *    porque perfect-freehand recalcula el outline completo cada vez.
+ *  - capa viva (#live-canvas): el trazo en curso, repintado por frame (rAF).
  *
  * Todo el dibujo de tinta ocurre en unidades de documento; el transform del
  * contexto (DPR × viewport) hace el resto.
@@ -34,6 +60,8 @@ export class CanvasSurface {
   private dpr = 1;
   /** Cache de Path2D por trazo terminado (clave débil: se libera solo). */
   private readonly pathCache = new WeakMap<Stroke, Path2D>();
+  /** Cache del bitmap compuesto (color+grano) de los trazos de lápiz. */
+  private readonly pencilCache = new WeakMap<Stroke, PencilBitmap>();
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -78,25 +106,56 @@ export class CanvasSurface {
   }
 
   /** Path2D cacheado de un trazo terminado (calcula el outline solo una vez). */
-  private pathFor(stroke: Stroke, opts: FreehandOptions): Path2D {
+  private pathFor(stroke: Stroke): Path2D {
     let path = this.pathCache.get(stroke);
     if (!path) {
-      path = outlineToPath(strokeOutline(stroke.points, opts));
+      path = outlineToPath(strokeOutline(stroke.points, freehandOptsFor(stroke)));
       this.pathCache.set(stroke, path);
     }
     return path;
+  }
+
+  /** Bitmap compuesto (color + grano) de un trazo de lápiz, cacheado. */
+  private pencilFor(stroke: Stroke): PencilBitmap | null {
+    let bitmap = this.pencilCache.get(stroke);
+    if (!bitmap) {
+      const path = this.pathFor(stroke);
+      const outline = strokeOutline(stroke.points, freehandOptsFor(stroke));
+      const box = outlineBBox(outline, 2);
+      if (!box) return null;
+      bitmap = {
+        canvas: composePencilBitmap(path, stroke.color, box, grainAlpha(avgPressure(stroke))),
+        box,
+      };
+      this.pencilCache.set(stroke, bitmap);
+    }
+    return bitmap;
+  }
+
+  /** Pinta un trazo terminado con el estilo de su pincel (contexto ya transformado). */
+  private drawStrokeStyled(stroke: Stroke): void {
+    const { ctx } = this;
+    const def = BRUSHES[stroke.brush];
+    ctx.globalAlpha = def.opacity;
+    ctx.globalCompositeOperation = def.composite;
+    if (def.textured) {
+      const bitmap = this.pencilFor(stroke);
+      if (bitmap) {
+        ctx.drawImage(bitmap.canvas, bitmap.box.x, bitmap.box.y, bitmap.box.w, bitmap.box.h);
+      }
+    } else {
+      ctx.fillStyle = stroke.color;
+      ctx.fill(this.pathFor(stroke));
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
   }
 
   /**
    * Repinta la escena completa de la capa estática: escritorio, página con
    * sombra y todos los trazos (recortados a la página).
    */
-  renderScene(
-    page: Page,
-    viewport: Viewport,
-    strokes: readonly Stroke[],
-    optsFor: (s: Stroke) => FreehandOptions,
-  ): void {
+  renderScene(page: Page, viewport: Viewport, strokes: readonly Stroke[]): void {
     const { ctx } = this;
     ctx.save();
     // Escritorio a pantalla completa (espacio de pantalla, solo DPR).
@@ -116,32 +175,38 @@ export class CanvasSurface {
 
     // Tinta, recortada al papel.
     this.clipToPage(page);
-    for (const stroke of strokes) {
-      ctx.fillStyle = stroke.color;
-      ctx.fill(this.pathFor(stroke, optsFor(stroke)));
-    }
+    for (const stroke of strokes) this.drawStrokeStyled(stroke);
     ctx.restore();
   }
 
   /**
-   * Frame del trazo vivo: borra la zona del frame anterior (bbox en unidades
-   * de documento) y rellena el path actual, recortado a la página.
-   * Es el hot path: un clearRect parcial + un fill por frame.
+   * Frame del trazo vivo: borra la zona del frame anterior y rellena el path
+   * actual con el estilo del pincel, recortado a la página. Hot path.
+   *
+   * El subrayador se previsualiza con alpha simple (multiply no cruza
+   * canvases DOM) y el lápiz aplica el grano directamente: en esta capa
+   * solo vive el trazo en curso, no hay nada que agujerear.
    */
   renderLiveStroke(
     path: Path2D,
-    color: string,
+    stroke: Stroke,
+    box: BBox,
     page: Page,
     viewport: Viewport,
     clearBox: BBox | null,
   ): void {
     const { ctx } = this;
+    const def = BRUSHES[stroke.brush];
     ctx.save();
     this.applyViewport(viewport);
     if (clearBox) ctx.clearRect(clearBox.x, clearBox.y, clearBox.w, clearBox.h);
     this.clipToPage(page);
-    ctx.fillStyle = color;
+    ctx.globalAlpha = def.composite === 'multiply' ? HIGHLIGHTER_PREVIEW_ALPHA : def.opacity;
+    ctx.fillStyle = stroke.color;
     ctx.fill(path);
+    if (def.textured) {
+      subtractGrain(ctx, path, box, grainAlpha(avgPressure(stroke)));
+    }
     ctx.restore();
   }
 }
