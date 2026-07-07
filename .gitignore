@@ -1,0 +1,6 @@
+# Datos locales de la app
+notes.json
+
+# Python
+__pycache__/
+*.pyc
